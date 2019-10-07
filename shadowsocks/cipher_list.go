@@ -61,23 +61,18 @@ func matchesIP(e *list.Element, clientIP net.IP) bool {
 func (cl *cipherList) SafeSnapshotForClientIP(clientIP net.IP) []*list.Element {
 	cl.mu.RLock()
 	defer cl.mu.RUnlock()
-	cipherArray := make([]*list.Element, cl.list.Len())
-	i := 0
-	// First pass: put all ciphers with matching last known IP at the front.
+	cipherArray := make([]*list.Element, 0, cl.list.Len())
+	remainingCiphers := make([]*list.Element, 0, cl.list.Len())
+	// Put all ciphers with matching last known IP at the front.
 	for e := cl.list.Front(); e != nil; e = e.Next() {
 		if matchesIP(e, clientIP) {
-			cipherArray[i] = e
-			i++
+			cipherArray = append(cipherArray, e)
+		} else {
+			remainingCiphers = append(remainingCiphers, e)
 		}
 	}
-	// Second pass: include all remaining ciphers in recency order.
-	for e := cl.list.Front(); e != nil; e = e.Next() {
-		if !matchesIP(e, clientIP) {
-			cipherArray[i] = e
-			i++
-		}
-	}
-	return cipherArray
+	// Include all remaining ciphers in recency order.
+	return append(cipherArray, remainingCiphers...)
 }
 
 func (cl *cipherList) SafeMarkUsedByClientIP(e *list.Element, clientIP net.IP) {
