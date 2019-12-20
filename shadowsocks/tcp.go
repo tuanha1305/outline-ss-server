@@ -107,7 +107,7 @@ type tcpService struct {
 	ivCache     IVCache
 }
 
-// Prevent replays of this many of the most recent handshakes.
+// Prevent replays of this many recent handshakes.
 const replayHistory = 1e6
 
 // NewTCPService creates a TCPService
