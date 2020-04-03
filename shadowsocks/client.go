@@ -6,10 +6,17 @@ import (
 	"net"
 
 	onet "github.com/Jigsaw-Code/outline-ss-server/net"
+	"github.com/Jigsaw-Code/outline-ss-server/shadowsocks/slicepool"
 	"github.com/shadowsocks/go-shadowsocks2/core"
 	"github.com/shadowsocks/go-shadowsocks2/shadowaead"
 	"github.com/shadowsocks/go-shadowsocks2/socks"
 )
+
+// maxUDPBufferSize is the maximum supported UDP packet size in bytes.
+const maxUDPBufferSize = 16 * 1024
+
+// udpPool stores the byte slices used for storing encrypted packets.
+var udpPool = slicepool.MakePool(maxUDPBufferSize)
 
 // Client is a client for Shadowsocks TCP and UDP connections.
 type Client interface {
@@ -87,8 +94,9 @@ func (c *packetConn) WriteTo(b []byte, addr net.Addr) (int, error) {
 	if socksTargetAddr == nil {
 		return 0, errors.New("Failed to parse target address")
 	}
-	cipherBuf := newUDPBuffer()
-	defer freeUDPBuffer(cipherBuf)
+	box := slicepool.MakeBox(&udpPool)
+	cipherBuf := box.Acquire()
+	defer box.Release()
 	saltSize := c.cipher.SaltSize()
 	// Copy the SOCKS target address and payload, reserving space for the generated salt to avoid
 	// partially overlapping the plaintext and cipher slices since `Pack` skips the salt when calling
@@ -104,8 +112,9 @@ func (c *packetConn) WriteTo(b []byte, addr net.Addr) (int, error) {
 
 // ReadFrom reads from the embedded PacketConn and decrypts into `b`.
 func (c *packetConn) ReadFrom(b []byte) (int, net.Addr, error) {
-	cipherBuf := newUDPBuffer()
-	defer freeUDPBuffer(cipherBuf)
+	box := slicepool.MakeBox(&udpPool)
+	cipherBuf := box.Acquire()
+	defer box.Release()
 	n, err := c.UDPConn.Read(cipherBuf)
 	if err != nil {
 		return 0, nil, err

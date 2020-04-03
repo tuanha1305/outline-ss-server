@@ -18,14 +18,26 @@ import (
 	"bytes"
 	"crypto/cipher"
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"io"
 
+	"github.com/Jigsaw-Code/outline-ss-server/shadowsocks/slicepool"
 	"github.com/shadowsocks/go-shadowsocks2/shadowaead"
 )
 
 // payloadSizeMask is the maximum size of payload in bytes.
 const payloadSizeMask = 0x3FFF // 16*1024 - 1
+
+// Maximum allowed cipher overhead
+const maxCipherOverhead = 16
+
+// The largest buffer we could need is for decrypting a max-length payload in
+// shadowsocksWriter.
+const maxBufferSize = 2 + maxCipherOverhead + payloadSizeMask + maxCipherOverhead
+
+// Buffer pool used for encrypting and decrypting Shadowsocks streams.
+var ssPool = slicepool.MakePool(maxBufferSize)
 
 // Writer is an io.Writer that also implements io.ReaderFrom to
 // allow for piping the data without extra allocations and copies.
@@ -37,8 +49,11 @@ type Writer interface {
 type shadowsocksWriter struct {
 	writer   io.Writer
 	ssCipher shadowaead.Cipher
+	// Wrapper for input that arrives as a slice.
+	input bytes.Reader
+	// Holds the first byte of each segment.
+	firstByte [1]byte
 	// These are lazily initialized:
-	buf  []byte
 	aead cipher.AEAD
 	// Index of the next encrypted chunk to write.
 	counter []byte
@@ -66,21 +81,23 @@ func (sw *shadowsocksWriter) init() (err error) {
 		if err != nil {
 			return fmt.Errorf("failed to create AEAD: %v", err)
 		}
+		if sw.aead.Overhead() > maxCipherOverhead {
+			return fmt.Errorf("Excessive cipher overhead (%d)", sw.aead.Overhead())
+		}
 		sw.counter = make([]byte, sw.aead.NonceSize())
-		sw.buf = make([]byte, 2+sw.aead.Overhead()+payloadSizeMask+sw.aead.Overhead())
 	}
 	return nil
 }
 
 // WriteBlock encrypts and writes the input buffer as one signed block.
-func (sw *shadowsocksWriter) encryptBlock(ciphertext []byte, plaintext []byte) ([]byte, error) {
-	out := sw.aead.Seal(ciphertext, sw.counter, plaintext, nil)
+func (sw *shadowsocksWriter) encryptBlock(ciphertext []byte, plaintext []byte) {
+	sw.aead.Seal(ciphertext, sw.counter, plaintext, nil)
 	increment(sw.counter)
-	return out, nil
 }
 
 func (sw *shadowsocksWriter) Write(p []byte) (int, error) {
-	n, err := sw.ReadFrom(bytes.NewReader(p))
+	sw.input.Reset(p)
+	n, err := sw.ReadFrom(&sw.input)
 	return int(n), err
 }
 
@@ -89,27 +106,33 @@ func (sw *shadowsocksWriter) ReadFrom(r io.Reader) (int64, error) {
 		return 0, err
 	}
 	var written int64
-	sizeBuf := sw.buf[:2+sw.aead.Overhead()]
-	payloadBuf := sw.buf[len(sizeBuf):]
+	box := slicepool.MakeBox(&ssPool)
 	for {
-		plaintextSize, err := r.Read(payloadBuf[:payloadSizeMask])
+		// Read the first byte of a segment separately from the remaining bytes.
+		// This allows us to release `buf` between segments.
+		plaintextSize, err := r.Read(sw.firstByte[:])
 		if plaintextSize > 0 {
+			buf := box.Acquire()
+			sizeBuf := buf[:2+sw.aead.Overhead()]
+			payloadBuf := buf[len(sizeBuf):]
+			payloadBuf[0] = sw.firstByte[0]
+			plaintextSize, err = r.Read(payloadBuf[1:payloadSizeMask])
+			plaintextSize++ // Account for first byte
 			// big-endian payload size
 			sizeBuf[0], sizeBuf[1] = byte(plaintextSize>>8), byte(plaintextSize)
-			_, err = sw.encryptBlock(sizeBuf[:0], sizeBuf[:2])
-			if err != nil {
-				return written, fmt.Errorf("failed to encypt payload size: %v", err)
-			}
-			_, err := sw.encryptBlock(payloadBuf[:0], payloadBuf[:plaintextSize])
-			if err != nil {
-				return written, fmt.Errorf("failed to encrypt payload: %v", err)
-			}
+			sw.encryptBlock(sizeBuf[:0], sizeBuf[:2])
+			sw.encryptBlock(payloadBuf[:0], payloadBuf[:plaintextSize])
 			payloadSize := plaintextSize + sw.aead.Overhead()
-			_, err = sw.writer.Write(sw.buf[:len(sizeBuf)+payloadSize])
+			_, writeErr := sw.writer.Write(buf[:len(sizeBuf)+payloadSize])
+			// Don't hold onto the large buffer while waiting for the next segment.
+			box.Release()
+			if writeErr != nil {
+				return written, fmt.Errorf("Failed to write payload: %v", writeErr)
+			}
 			written += int64(plaintextSize)
 		}
 		if err != nil {
-			if err == io.EOF { // ignore EOF as per io.ReaderFrom contract
+			if errors.Is(err, io.EOF) { // ignore EOF as per io.ReaderFrom contract
 				return written, nil
 			}
 			return written, fmt.Errorf("Failed to read payload: %v", err)
@@ -123,8 +146,12 @@ type shadowsocksReader struct {
 	// These are lazily initialized:
 	aead cipher.AEAD
 	// Index of the next encrypted chunk to read.
-	counter  []byte
-	buf      []byte
+	counter []byte
+	// Buffer for the uint16 size and its AEAD tag.  Made in init().
+	size []byte
+	// Holds a buffer for the payload and its AEAD tag, when needed.
+	payload slicepool.Box
+	// A view of any pending payload in `payload`.
 	leftover []byte
 }
 
@@ -138,7 +165,11 @@ type Reader interface {
 // NewShadowsocksReader creates a Reader that decrypts the given Reader using
 // the shadowsocks protocol with the given shadowsocks cipher.
 func NewShadowsocksReader(reader io.Reader, ssCipher shadowaead.Cipher) Reader {
-	return &shadowsocksReader{reader: reader, ssCipher: ssCipher}
+	return &shadowsocksReader{
+		reader:   reader,
+		ssCipher: ssCipher,
+		payload:  slicepool.MakeBox(&ssPool),
+	}
 }
 
 // init reads the salt from the inner Reader and sets up the AEAD object
@@ -147,88 +178,100 @@ func (sr *shadowsocksReader) init() (err error) {
 		// For chacha20-poly1305, SaltSize is 32, NonceSize is 12 and Overhead is 16.
 		salt := make([]byte, sr.ssCipher.SaltSize())
 		if _, err := io.ReadFull(sr.reader, salt); err != nil {
-			if err != io.EOF && err != io.ErrUnexpectedEOF {
-				err = fmt.Errorf("failed to read salt: %v", err)
-			}
-			return err
+			return fmt.Errorf("failed to read salt: %w", err)
 		}
 		sr.aead, err = sr.ssCipher.Decrypter(salt)
 		if err != nil {
 			return fmt.Errorf("failed to create AEAD: %v", err)
 		}
+		if sr.aead.Overhead() > maxCipherOverhead {
+			return fmt.Errorf("Excessive cipher overhead (%d)", sr.aead.Overhead())
+		}
 		sr.counter = make([]byte, sr.aead.NonceSize())
-		sr.buf = make([]byte, payloadSizeMask+sr.aead.Overhead())
+		sr.size = make([]byte, 2+sr.aead.Overhead())
 	}
 	return nil
 }
 
 // ReadBlock reads and decrypts a single signed block of ciphertext.
-// The block will match the given decryptedBlockSize.
-// The returned slice is only valid until the next Read call.
-func (sr *shadowsocksReader) readBlock(decryptedBlockSize int) ([]byte, error) {
-	if err := sr.init(); err != nil {
-		return nil, err
-	}
-	cipherBlockSize := decryptedBlockSize + sr.aead.Overhead()
-	if cipherBlockSize > cap(sr.buf) {
-		return nil, io.ErrShortBuffer
-	}
-	buf := sr.buf[:cipherBlockSize]
+// The block must exactly match the size of `buf`.
+// Returns an error only if the block could not be read.
+func (sr *shadowsocksReader) readBlock(buf []byte) error {
 	_, err := io.ReadFull(sr.reader, buf)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	buf, err = sr.aead.Open(buf[:0], sr.counter, buf, nil)
+	_, err = sr.aead.Open(buf[:0], sr.counter, buf, nil)
 	increment(sr.counter)
 	if err != nil {
-		return nil, fmt.Errorf("failed to decrypt: %v", err)
+		return fmt.Errorf("failed to decrypt: %v", err)
 	}
-	return buf, nil
+	return nil
 }
 
 func (sr *shadowsocksReader) Read(b []byte) (int, error) {
-	n, err := sr.readLoop(b)
-	return int(n), err
+	if err := sr.populateLeftover(); err != nil {
+		if errors.Is(err, io.EOF) {
+			// The Reader definition requires returning EOF itself.
+			err = io.EOF
+		}
+		return 0, err
+	}
+	n := copy(b, sr.leftover)
+	sr.drainLeftover(n)
+	return n, nil
 }
 
 func (sr *shadowsocksReader) WriteTo(w io.Writer) (written int64, err error) {
-	n, err := sr.readLoop(w)
-	if err == io.EOF {
-		err = nil
+	for {
+		if err = sr.populateLeftover(); err != nil {
+			if errors.Is(err, io.EOF) {
+				err = nil
+			}
+			return
+		}
+		var n int
+		n, err = w.Write(sr.leftover)
+		written += int64(n)
+		sr.drainLeftover(n)
+		if err != nil {
+			return
+		}
 	}
-	return n, err
 }
 
-func (sr *shadowsocksReader) readLoop(w interface{}) (written int64, err error) {
-	for {
-		if len(sr.leftover) == 0 {
-			buf, err := sr.readBlock(2)
-			if err != nil {
-				if err != io.EOF && err != io.ErrUnexpectedEOF {
-					err = fmt.Errorf("failed to read payload size: %v", err)
-				}
-				return written, err
-			}
-			size := (int(buf[0])<<8 + int(buf[1])) & payloadSizeMask
-			payload, err := sr.readBlock(size)
-			if err != nil {
-				return written, fmt.Errorf("failed to read payload: %v", err)
-			}
-			sr.leftover = payload
+// Ensures that sr.leftover is nonempty.  If leftover is empty, this method
+// waits for incoming data and decrypts it.
+// Returns an error only if sr.leftover could not be populated.
+func (sr *shadowsocksReader) populateLeftover() error {
+	if len(sr.leftover) != 0 {
+		return nil
+	}
+	if err := sr.init(); err != nil {
+		return err
+	}
+	if err := sr.readBlock(sr.size); err != nil {
+		return fmt.Errorf("failed to read payload size: %w", err)
+	}
+	size := (int(sr.size[0])<<8 + int(sr.size[1])) & payloadSizeMask
+	payload := sr.payload.Acquire()
+	if err := sr.readBlock(payload[:size+sr.aead.Overhead()]); err != nil {
+		if errors.Is(err, io.EOF) {
+			err = io.ErrUnexpectedEOF
 		}
-		switch v := w.(type) {
-		case io.Writer:
-			n, err := v.Write(sr.leftover)
-			written += int64(n)
-			sr.leftover = sr.leftover[n:]
-			if err != nil {
-				return written, err
-			}
-		case []byte:
-			n := copy(v, sr.leftover)
-			sr.leftover = sr.leftover[n:]
-			return int64(n), nil
-		}
+		return fmt.Errorf("failed to read payload: %w", err)
+	}
+	sr.leftover = payload[:size]
+	return nil
+}
+
+// Drains `n` bytes from sr.leftover, releasing the payload buffer when it
+// is fully drained.
+func (sr *shadowsocksReader) drainLeftover(n int) {
+	sr.leftover = sr.leftover[n:]
+	if len(sr.leftover) == 0 {
+		sr.leftover = nil
+		sr.payload.Release()
 	}
 }
 

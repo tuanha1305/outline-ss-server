@@ -2,6 +2,7 @@ package shadowsocks
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"strings"
@@ -40,7 +41,7 @@ func TestCipherReaderUnexpectedEOF(t *testing.T) {
 	clientReader := strings.NewReader("short")
 	server := NewShadowsocksReader(clientReader, cipher)
 	_, err := server.Read(make([]byte, 10))
-	if err != io.ErrUnexpectedEOF {
+	if !errors.Is(err, io.ErrUnexpectedEOF) {
 		t.Fatalf("Expected ErrUnexpectedEOF, got %v", err)
 	}
 }

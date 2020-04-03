@@ -73,7 +73,7 @@ func debugTCP(cipherID, template string, val interface{}) {
 
 func findAccessKey(clientConn onet.DuplexConn, cipherList CipherList) (string, onet.DuplexConn, []byte, error) {
 	// This must have enough space to hold the salt + 2 bytes chunk length + AEAD tag (Overhead) for any cipher
-	firstBytes := make([]byte, 0, 32+2+16)
+	firstBytes := make([]byte, 0, 32+2+maxCipherOverhead)
 	// Constant of zeroes to use as the start chunk count. This must be as big as the max NonceSize() across all ciphers.
 	zeroCountBuf := [12]byte{} // MaxCountSize
 	// To hold the decrypted chunk length.
