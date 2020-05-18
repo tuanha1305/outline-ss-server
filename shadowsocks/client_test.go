@@ -3,6 +3,7 @@ package shadowsocks
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"strconv"
@@ -20,34 +21,44 @@ const (
 )
 
 func TestShadowsocksClient_DialTCP(t *testing.T) {
+	fmt.Println("TCP 1")
 	proxyAddr := startShadowsocksTCPEchoProxy(testTargetAddr, t)
+	fmt.Println("TCP 2")
 	proxyHost, proxyPort, err := splitHostPortNumber(proxyAddr.String())
 	if err != nil {
 		t.Fatalf("Failed to parse proxy address: %v", err)
 	}
+	fmt.Println("TCP 3")
 	d, err := NewClient(proxyHost, proxyPort, testPassword, testCipher)
 	if err != nil {
 		t.Fatalf("Failed to create ShadowsocksClient: %v", err)
 	}
+	fmt.Println("TCP 4")
 	conn, err := d.DialTCP(nil, testTargetAddr)
 	if err != nil {
 		t.Fatalf("ShadowsocksClient.DialTCP failed: %v", err)
 	}
 	defer conn.Close()
+	fmt.Println("TCP 5")
 	conn.SetReadDeadline(time.Now().Add(time.Second * 5))
 	expectEchoPayload(conn, MakeTestPayload(1024), make([]byte, 1024), t)
+	fmt.Println("TCP 6")
 }
 
 func TestShadowsocksClient_ListenUDP(t *testing.T) {
+	fmt.Println("UDP 1")
 	proxyAddr := startShadowsocksUDPEchoServer(testTargetAddr, t)
+	fmt.Println("UDP 2")
 	proxyHost, proxyPort, err := splitHostPortNumber(proxyAddr.String())
 	if err != nil {
 		t.Fatalf("Failed to parse proxy address: %v", err)
 	}
+	fmt.Println("UDP 3")
 	d, err := NewClient(proxyHost, proxyPort, testPassword, testCipher)
 	if err != nil {
 		t.Fatalf("Failed to create ShadowsocksClient: %v", err)
 	}
+	fmt.Println("UDP 4")
 	conn, err := d.ListenUDP(nil)
 	if err != nil {
 		t.Fatalf("ShadowsocksClient.ListenUDP failed: %v", err)
@@ -55,7 +66,9 @@ func TestShadowsocksClient_ListenUDP(t *testing.T) {
 	defer conn.Close()
 	conn.SetReadDeadline(time.Now().Add(time.Second * 5))
 	pcrw := &packetConnReadWriter{PacketConn: conn, targetAddr: NewAddr(testTargetAddr, "udp")}
+	fmt.Println("UDP 5")
 	expectEchoPayload(pcrw, MakeTestPayload(1024), make([]byte, 1024), t)
+	fmt.Println("UDP 6")
 }
 
 func BenchmarkShadowsocksClient_DialTCP(b *testing.B) {
@@ -116,11 +129,13 @@ func BenchmarkShadowsocksClient_ListenUDP(b *testing.B) {
 }
 
 func startShadowsocksTCPEchoProxy(expectedTgtAddr string, t testing.TB) net.Addr {
+	fmt.Println("startTCP 1")
 	listener, err := net.ListenTCP("tcp", &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
 	if err != nil {
 		t.Fatalf("ListenTCP failed: %v", err)
 	}
 	t.Logf("Starting SS TCP echo proxy at %v\n", listener.Addr())
+	fmt.Println("startTCP 2")
 	cipher, err := newAeadCipher(testCipher, testPassword)
 	if err != nil {
 		t.Fatalf("Failed to create cipher: %v", err)
@@ -128,6 +143,7 @@ func startShadowsocksTCPEchoProxy(expectedTgtAddr string, t testing.TB) net.Addr
 	go func() {
 		defer listener.Close()
 		for {
+			fmt.Println("startTCP 3")
 			clientConn, err := listener.AcceptTCP()
 			if err != nil {
 				t.Fatalf("AcceptTCP failed: %v", err)
@@ -138,6 +154,7 @@ func startShadowsocksTCPEchoProxy(expectedTgtAddr string, t testing.TB) net.Addr
 				ssw := NewShadowsocksWriter(clientConn, cipher)
 				ssClientConn := onet.WrapConn(clientConn, ssr, ssw)
 
+				fmt.Println("startTCP 4")
 				tgtAddr, err := socks.ReadAddr(ssClientConn)
 				if err != nil {
 					t.Fatalf("Failed to read target address: %v", err)
@@ -145,7 +162,9 @@ func startShadowsocksTCPEchoProxy(expectedTgtAddr string, t testing.TB) net.Addr
 				if tgtAddr.String() != expectedTgtAddr {
 					t.Fatalf("Expected target address '%v'. Got '%v'", expectedTgtAddr, tgtAddr)
 				}
+				fmt.Println("startTCP 5")
 				io.Copy(ssw, ssr)
+				fmt.Println("startTCP 6")
 			}()
 		}
 	}()
@@ -153,6 +172,7 @@ func startShadowsocksTCPEchoProxy(expectedTgtAddr string, t testing.TB) net.Addr
 }
 
 func startShadowsocksUDPEchoServer(expectedTgtAddr string, t testing.TB) net.Addr {
+	fmt.Println("startUDP 1")
 	conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
 	if err != nil {
 		t.Fatalf("Proxy ListenUDP failed: %v", err)
@@ -164,17 +184,21 @@ func startShadowsocksUDPEchoServer(expectedTgtAddr string, t testing.TB) net.Add
 	if err != nil {
 		t.Fatalf("Failed to create cipher: %v", err)
 	}
+	fmt.Println("startUDP 2")
 	go func() {
 		defer conn.Close()
 		for {
+			fmt.Println("startUDP 3")
 			n, clientAddr, err := conn.ReadFromUDP(cipherBuf)
 			if err != nil {
 				t.Fatalf("Failed to read from UDP conn: %v", err)
 			}
+			fmt.Println("startUDP 4")
 			buf, err := shadowaead.Unpack(clientBuf, cipherBuf[:n], cipher)
 			if err != nil {
 				t.Fatalf("Failed to decrypt: %v", err)
 			}
+			fmt.Println("startUDP 5")
 			tgtAddr := socks.SplitAddr(buf)
 			if tgtAddr == nil {
 				t.Fatalf("Failed to read target address: %v", err)
@@ -187,10 +211,12 @@ func startShadowsocksUDPEchoServer(expectedTgtAddr string, t testing.TB) net.Add
 			if err != nil {
 				t.Fatalf("Failed to encrypt: %v", err)
 			}
+			fmt.Println("startUDP 6")
 			conn.WriteTo(buf, clientAddr)
 			if err != nil {
 				t.Fatalf("Failed to write: %v", err)
 			}
+			fmt.Println("startUDP 7")
 		}
 	}()
 	return conn.LocalAddr()
@@ -215,10 +241,12 @@ func (pc *packetConnReadWriter) Write(b []byte) (int, error) {
 // Writes `payload` to `conn` and reads it into `buf`, which we take as a parameter to avoid
 // reallocations in benchmarks and memory profiles. Fails the test if the read payload does not match.
 func expectEchoPayload(conn io.ReadWriter, payload, buf []byte, t testing.TB) {
+	fmt.Println("expectEcho 1")
 	_, err := conn.Write(payload)
 	if err != nil {
 		t.Fatalf("Failed to write payload: %v", err)
 	}
+	fmt.Println("expectEcho 2")
 	n, err := conn.Read(buf)
 	if err != nil {
 		t.Fatalf("Failed to read payload: %v", err)
@@ -226,6 +254,7 @@ func expectEchoPayload(conn io.ReadWriter, payload, buf []byte, t testing.TB) {
 	if !bytes.Equal(payload, buf[:n]) {
 		t.Fatalf("Expected output '%v'. Got '%v'", payload, buf[:n])
 	}
+	fmt.Println("expectEcho 3")
 }
 
 // splitHostPortNumber parses the host and port from `address`, which has the form `host:port`,

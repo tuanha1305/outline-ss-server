@@ -2,5 +2,6 @@
 language: go
 
 go:
-- "1.14"
-- "stable"
+- "1.14.3"
+
+script: go test -v ./shadowsocks/
