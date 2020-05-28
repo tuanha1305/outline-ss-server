@@ -97,6 +97,7 @@ func (sw *shadowsocksWriter) ReadFrom(r io.Reader) (int64, error) {
 	for {
 		plaintextSize, err := r.Read(payloadBuf[:payloadSizeMask])
 		if plaintextSize > 0 {
+			fmt.Printf("plaintextSize=%d\n", plaintextSize)
 			// big-endian payload size
 			sizeBuf[0], sizeBuf[1] = byte(plaintextSize>>8), byte(plaintextSize)
 			_, err = sw.encryptBlock(sizeBuf[:0], sizeBuf[:2])
