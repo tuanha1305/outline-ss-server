@@ -13,10 +13,15 @@ import (
 
 // Client is a client for Shadowsocks TCP and UDP connections.
 type Client interface {
-	// DialTCP connects to `raddr` over TCP though a Shadowsocks proxy.
-	// `laddr` is a local bind address, a local address is automatically chosen if nil.
+	// DialProxyTCP returns a connected socket to the proxy, or an error.
+	// `laddr` is a local bind address; a local address is automatically chosen if nil.
+	DialProxyTCP(laddr *net.TCPAddr) (onet.DuplexConn, error)
+
+	// DialDestinationTCP connects to `raddr` over TCP though a Shadowsocks proxy.
+	// `proxyConn` is a TCP socket to the proxy on which no bytes have yet been sent.
 	// `raddr` has the form `host:port`, where `host` can be a domain name or IP address.
-	DialTCP(laddr *net.TCPAddr, raddr string) (onet.DuplexConn, error)
+	// `hello` is an optional payload to deliver along with the opening message.
+	DialDestinationTCP(proxyConn onet.DuplexConn, raddr string, hello []byte) (onet.DuplexConn, error)
 
 	// ListenUDP relays UDP packets though a Shadowsocks proxy.
 	// `laddr` is a local bind address, a local address is automatically chosen if nil.
@@ -46,19 +51,19 @@ type ssClient struct {
 	cipher    shadowaead.Cipher
 }
 
-func (c *ssClient) DialTCP(laddr *net.TCPAddr, raddr string) (onet.DuplexConn, error) {
+func (c *ssClient) DialProxyTCP(laddr *net.TCPAddr) (onet.DuplexConn, error) {
+	proxyAddr := &net.TCPAddr{IP: c.proxyIP, Port: c.proxyPort}
+	return net.DialTCP("tcp", laddr, proxyAddr)
+}
+
+func (c *ssClient) DialDestinationTCP(proxyConn onet.DuplexConn, raddr string, hello []byte) (onet.DuplexConn, error) {
 	socksTargetAddr := socks.ParseAddr(raddr)
 	if socksTargetAddr == nil {
 		return nil, errors.New("Failed to parse target address")
 	}
-	proxyAddr := &net.TCPAddr{IP: c.proxyIP, Port: c.proxyPort}
-	proxyConn, err := net.DialTCP("tcp", laddr, proxyAddr)
-	if err != nil {
-		return nil, err
-	}
 	ssw := NewShadowsocksWriter(proxyConn, c.cipher)
-	_, err = ssw.Write(socksTargetAddr)
-	if err != nil {
+	firstWrite := append(socksTargetAddr, hello...)
+	if _, err := ssw.Write(firstWrite); err != nil {
 		proxyConn.Close()
 		return nil, errors.New("Failed to write target address")
 	}

@@ -29,7 +29,11 @@ func TestShadowsocksClient_DialTCP(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create ShadowsocksClient: %v", err)
 	}
-	conn, err := d.DialTCP(nil, testTargetAddr)
+	proxyConn, err := d.DialProxyTCP(nil)
+	if err != nil {
+		t.Fatalf("ShadowsocksClient.DialProxyTCP failed: %v", err)
+	}
+	conn, err := d.DialDestinationTCP(proxyConn, testTargetAddr, nil)
 	if err != nil {
 		t.Fatalf("ShadowsocksClient.DialTCP failed: %v", err)
 	}
@@ -71,7 +75,11 @@ func BenchmarkShadowsocksClient_DialTCP(b *testing.B) {
 	if err != nil {
 		b.Fatalf("Failed to create ShadowsocksClient: %v", err)
 	}
-	conn, err := d.DialTCP(nil, testTargetAddr)
+	proxyConn, err := d.DialProxyTCP(nil)
+	if err != nil {
+		b.Fatalf("ShadowsocksClient.DialProxyTCP failed: %v", err)
+	}
+	conn, err := d.DialDestinationTCP(proxyConn, testTargetAddr, nil)
 	if err != nil {
 		b.Fatalf("ShadowsocksClient.DialTCP failed: %v", err)
 	}

@@ -109,7 +109,11 @@ func TestTCPEcho(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create ShadowsocksClient: %v", err)
 	}
-	conn, err := client.DialTCP(nil, echoListener.Addr().String())
+	proxyConn, err := client.DialProxyTCP(nil)
+	if err != nil {
+		t.Fatalf("ShadowsocksClient.DialProxyTCP failed: %v", err)
+	}
+	conn, err := client.DialDestinationTCP(proxyConn, echoListener.Addr().String(), nil)
 	if err != nil {
 		t.Fatalf("ShadowsocksClient.DialTCP failed: %v", err)
 	}
@@ -302,7 +306,11 @@ func BenchmarkTCPThroughput(b *testing.B) {
 	if err != nil {
 		b.Fatalf("Failed to create ShadowsocksClient: %v", err)
 	}
-	conn, err := client.DialTCP(nil, echoListener.Addr().String())
+	proxyConn, err := client.DialProxyTCP(nil)
+	if err != nil {
+		b.Fatalf("ShadowsocksClient.DialProxyTCP failed: %v", err)
+	}
+	conn, err := client.DialDestinationTCP(proxyConn, echoListener.Addr().String(), nil)
 	if err != nil {
 		b.Fatalf("ShadowsocksClient.DialTCP failed: %v", err)
 	}
@@ -384,7 +392,11 @@ func BenchmarkTCPMultiplexing(b *testing.B) {
 		go func() {
 			defer wg.Done()
 			for i := 0; i < k; i++ {
-				conn, err := client.DialTCP(nil, echoListener.Addr().String())
+				proxyConn, err := client.DialProxyTCP(nil)
+				if err != nil {
+					b.Fatalf("ShadowsocksClient.DialProxyTCP failed: %v", err)
+				}
+				conn, err := client.DialDestinationTCP(proxyConn, echoListener.Addr().String(), nil)
 				if err != nil {
 					b.Fatalf("ShadowsocksClient.DialTCP failed: %v", err)
 				}
