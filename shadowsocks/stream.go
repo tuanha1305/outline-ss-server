@@ -21,6 +21,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"sync"
 
 	"github.com/shadowsocks/go-shadowsocks2/shadowaead"
 )
@@ -30,9 +31,20 @@ const payloadSizeMask = 0x3FFF // 16*1024 - 1
 
 // Writer is an io.Writer that also implements io.ReaderFrom to
 // allow for piping the data without extra allocations and copies.
+// The LazyWrite and Flush methods allow a header to be
+// added but delayed until the first write, for concatenation.
+// All methods except Flush must be called from a single thread.
 type Writer interface {
 	io.Writer
 	io.ReaderFrom
+	// LazyWrite queues p to be written, but doesn't send it until
+	// Flush() is called, a non-lazy Write() is made, or the buffer
+	// is filled.
+	LazyWrite(p []byte) (int, error)
+	// Flush sends the pending lazy data, if any.  This method is
+	// thread-safe with respect to Write and ReadFrom, but must not
+	// be concurrent with LazyWrite.
+	Flush() error
 }
 
 type shadowsocksWriter struct {
@@ -40,7 +52,11 @@ type shadowsocksWriter struct {
 	ssCipher shadowaead.Cipher
 	// Wrapper for input that arrives as a slice.
 	byteWrapper bytes.Reader
-	// These are lazily initialized:
+	// Action to flush a pending lazy write.
+	flush sync.Once
+	// Number of bytes that are currently buffered.
+	pending int
+	// These are populated by init():
 	buf  []byte
 	aead cipher.AEAD
 	// Index of the next encrypted chunk to write.
@@ -85,10 +101,34 @@ func (sw *shadowsocksWriter) encryptBlock(plaintext []byte) int {
 	return len(out)
 }
 
+// Write modes
+const (
+	modeNormal = iota // Normal write
+	modeLazy          // Lazy write
+	modeFlush         // Write during a flush
+)
+
 func (sw *shadowsocksWriter) Write(p []byte) (int, error) {
+	return sw.write(p, modeNormal)
+}
+
+func (sw *shadowsocksWriter) write(p []byte, mode int) (int, error) {
 	sw.byteWrapper.Reset(p)
-	n, err := sw.ReadFrom(&sw.byteWrapper)
+	n, err := sw.readFrom(&sw.byteWrapper, mode)
 	return int(n), err
+}
+
+func (sw *shadowsocksWriter) LazyWrite(p []byte) (int, error) {
+	sw.flush = sync.Once{} // Reset flush action.
+	return sw.write(p, modeLazy)
+}
+
+func (sw *shadowsocksWriter) Flush() error {
+	var err error
+	sw.flush.Do(func() {
+		_, err = sw.write(nil, modeFlush)
+	})
+	return err
 }
 
 func isZero(b []byte) bool {
@@ -101,9 +141,21 @@ func isZero(b []byte) bool {
 }
 
 func (sw *shadowsocksWriter) ReadFrom(r io.Reader) (int64, error) {
+	return sw.readFrom(r, modeNormal)
+}
+
+func (sw *shadowsocksWriter) readFrom(r io.Reader, mode int) (int64, error) {
 	if err := sw.init(); err != nil {
 		return 0, err
 	}
+
+	if mode == modeNormal {
+		// Prevent a concurrent or subsequent flush.  A normal write will
+		// automatically flush any pending data, and a concurrent flush
+		// would create a race condition.
+		sw.flush.Do(func() {})
+	}
+
 	var written int64
 
 	// sw.buf starts with the salt.
@@ -122,13 +174,15 @@ func (sw *shadowsocksWriter) ReadFrom(r io.Reader) (int64, error) {
 	sizeBuf := sw.buf[saltSize : saltSize+2+sw.aead.Overhead()]
 	payloadBuf := sw.buf[saltSize+len(sizeBuf):]
 	for {
-		plaintextSize, err := r.Read(payloadBuf[:payloadSizeMask])
-		if plaintextSize > 0 {
-			binary.BigEndian.PutUint16(sizeBuf, uint16(plaintextSize))
+		plaintextSize, err := r.Read(payloadBuf[sw.pending:payloadSizeMask])
+		sw.pending += plaintextSize
+		written += int64(plaintextSize) // Buffered data counts as written
+		if sw.pending == payloadSizeMask || (mode != modeLazy && sw.pending > 0) {
+			binary.BigEndian.PutUint16(sizeBuf, uint16(sw.pending))
 			sw.encryptBlock(sizeBuf[:2])
-			payloadSize := sw.encryptBlock(payloadBuf[:plaintextSize])
+			payloadSize := sw.encryptBlock(payloadBuf[:sw.pending])
 			_, err = sw.writer.Write(sw.buf[start : saltSize+len(sizeBuf)+payloadSize])
-			written += int64(plaintextSize)
+			sw.pending = 0
 			start = saltSize // Skip the salt for all writes except the first.
 		}
 		if err != nil {

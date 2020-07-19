@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"strings"
 	"testing"
 
@@ -171,5 +172,160 @@ func TestEndToEnd(t *testing.T) {
 	}
 	if output.String() != expected {
 		t.Fatalf("Expected output '%v'. Got '%v'", expected, output.String())
+	}
+}
+
+func TestLazyWriteFlush(t *testing.T) {
+	cipher := newTestCipher(t)
+	buf := new(bytes.Buffer)
+	writer := NewShadowsocksWriter(buf, cipher)
+	header := []byte{1, 2, 3, 4}
+	n, err := writer.LazyWrite(header)
+	if n != 4 {
+		t.Errorf("Wrong write size: %d", n)
+	}
+	if err != nil {
+		t.Errorf("LazyWrite failed: %v", err)
+	}
+	if buf.Len() != 0 {
+		t.Errorf("LazyWrite isn't lazy: %v", buf.Bytes())
+	}
+	if err = writer.Flush(); err != nil {
+		t.Errorf("Flush failed: %v", err)
+	}
+	len1 := buf.Len()
+	if len1 == 0 {
+		t.Errorf("No bytes flushed")
+	}
+
+	// Check that normal writes now work
+	body := []byte{5, 6, 7, 8}
+	n, err = writer.Write(body)
+	if n != 4 {
+		t.Errorf("Wrong write size: %d", n)
+	}
+	if err != nil {
+		t.Errorf("Write failed: %v", err)
+	}
+	if buf.Len() == len1 {
+		t.Errorf("No write observed")
+	}
+
+	// Verify content arrives in two blocks
+	reader := NewShadowsocksReader(buf, cipher)
+	decrypted := make([]byte, 8)
+	n, err = reader.Read(decrypted)
+	if n != 4 {
+		t.Errorf("Wrong number of bytes out: %d", n)
+	}
+	if err != nil {
+		t.Errorf("Read failed: %v", err)
+	}
+	if !bytes.Equal(decrypted[:4], header) {
+		t.Errorf("Wrong final content: %v", decrypted)
+	}
+	n, err = reader.Read(decrypted[4:])
+	if n != 4 {
+		t.Errorf("Wrong number of bytes out: %d", n)
+	}
+	if err != nil {
+		t.Errorf("Read failed: %v", err)
+	}
+	if !bytes.Equal(decrypted[4:], body) {
+		t.Errorf("Wrong final content: %v", decrypted)
+	}
+}
+
+func TestLazyWriteConcat(t *testing.T) {
+	cipher := newTestCipher(t)
+	buf := new(bytes.Buffer)
+	writer := NewShadowsocksWriter(buf, cipher)
+	header := []byte{1, 2, 3, 4}
+	n, err := writer.LazyWrite(header)
+	if n != 4 {
+		t.Errorf("Wrong write size: %d", n)
+	}
+	if err != nil {
+		t.Errorf("LazyWrite failed: %v", err)
+	}
+	if buf.Len() != 0 {
+		t.Errorf("LazyWrite isn't lazy: %v", buf.Bytes())
+	}
+
+	// Write additional data and flush the header.
+	body := []byte{5, 6, 7, 8}
+	n, err = writer.Write(body)
+	if n != 4 {
+		t.Errorf("Wrong write size: %d", n)
+	}
+	if err != nil {
+		t.Errorf("Write failed: %v", err)
+	}
+	len1 := buf.Len()
+	if len1 == 0 {
+		t.Errorf("Buffer is still empty")
+	}
+
+	// Flush after write should have no effect
+	if err = writer.Flush(); err != nil {
+		t.Errorf("Flush failed: %v", err)
+	}
+	if buf.Len() != len1 {
+		t.Errorf("Flush should have no effect")
+	}
+
+	// Verify content arrives in one block
+	reader := NewShadowsocksReader(buf, cipher)
+	decrypted := make([]byte, 8)
+	n, err = reader.Read(decrypted)
+	if n != 8 {
+		t.Errorf("Wrong number of bytes out: %d", n)
+	}
+	if err != nil {
+		t.Errorf("Read failed: %v", err)
+	}
+	if !bytes.Equal(decrypted[:4], header) ||
+		!bytes.Equal(decrypted[4:], body) {
+		t.Errorf("Wrong final content: %v", decrypted)
+	}
+}
+
+func TestLazyWriteOversize(t *testing.T) {
+	cipher := newTestCipher(t)
+	buf := new(bytes.Buffer)
+	writer := NewShadowsocksWriter(buf, cipher)
+	N := 25000 // More than one block, less than two.
+	data := make([]byte, N)
+	for i := range data {
+		data[i] = byte(i)
+	}
+	n, err := writer.LazyWrite(data)
+	if n != len(data) {
+		t.Errorf("Wrong write size: %d", n)
+	}
+	if err != nil {
+		t.Errorf("LazyWrite failed: %v", err)
+	}
+	if buf.Len() >= N {
+		t.Errorf("Too much data in first block: %d", buf.Len())
+	}
+	if err = writer.Flush(); err != nil {
+		t.Errorf("Flush failed: %v", err)
+	}
+	if buf.Len() <= N {
+		t.Errorf("Not enough data written after flush: %d", buf.Len())
+	}
+
+	// Verify content
+	reader := NewShadowsocksReader(buf, cipher)
+	decrypted, err := ioutil.ReadAll(reader)
+	if len(decrypted) != N {
+		t.Errorf("Wrong number of bytes out: %d", len(decrypted))
+	}
+	if err != nil {
+		t.Errorf("Read failed: %v", err)
+	}
+	if !bytes.Equal(decrypted, data) {
+		t.Errorf("Wrong final content: %v", decrypted)
 	}
 }
